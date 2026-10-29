@@ -1,43 +1,48 @@
 {
-  "name": "kiro-acp",
-  "displayName": "Kiro CLI Models for Copilot Chat",
-  "description": "Use Kiro CLI's models in GitHub Copilot Chat through the Agent Client Protocol.",
-  "icon": "assets/icon.png",
-  "version": "0.6.0",
-  "publisher": "local",
-  "private": true,
-  "engines": {
-    "vscode": "^1.105.0"
-  },
-  "categories": [
-    "AI",
-    "Chat"
-  ],
-  "main": "./dist/extension.js",
-  "activationEvents": [
-    "onStartupFinished",
-    "onLanguageModelChatProvider:kiro"
-  ],
-  "contributes": {
-    "languageModelChatProviders": [
-      {
-        "vendor": "kiro",
-        "displayName": "Kiro CLI"
-      }
-    ]
-  },
-  "scripts": {
-    "typecheck": "tsc -p . --noEmit",
-    "build": "npm run typecheck && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js",
-    "check": "esbuild test/selfcheck.ts --bundle --platform=node --outfile=dist-test/selfcheck.js && node dist-test/selfcheck.js",
-    "smoke": "esbuild test/smoke.ts --bundle --platform=node --outfile=dist-test/smoke.js && node dist-test/smoke.js",
-    "package": "npm run build && vsce package --no-dependencies --allow-missing-repository"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.0",
-    "@types/vscode": "^1.105.0",
-    "@vscode/vsce": "^3.0.0",
-    "esbuild": "^0.25.0",
-    "typescript": "^5.9.0"
-  }
+    "name": "kiro-acp",
+    "displayName": "Kiro CLI Models for Copilot Chat",
+    "description": "Use Kiro CLI's models in GitHub Copilot Chat through the Agent Client Protocol.",
+    "icon": "assets/icon.png",
+    "version": "0.6.1",
+    "publisher": "ExplorationToolkit",
+    "private": true,
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/SamuelBradley/kiro-acp.git"
+    },
+    "engines": {
+        "vscode": "^1.105.0"
+    },
+    "categories": [
+        "AI",
+        "Chat"
+    ],
+    "main": "./dist/extension.js",
+    "activationEvents": [
+        "onStartupFinished",
+        "onLanguageModelChatProvider:kiro"
+    ],
+    "contributes": {
+        "languageModelChatProviders": [
+            {
+                "vendor": "kiro",
+                "displayName": "Kiro CLI"
+            }
+        ]
+    },
+    "scripts": {
+        "typecheck": "tsc -p . --noEmit",
+        "build": "npm run typecheck && esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js",
+        "check": "esbuild test/selfcheck.ts --bundle --platform=node --outfile=dist-test/selfcheck.js && node dist-test/selfcheck.js",
+        "smoke": "esbuild test/smoke.ts --bundle --platform=node --outfile=dist-test/smoke.js && node dist-test/smoke.js",
+        "package": "npm run build && vsce package --no-dependencies --allow-missing-repository"
+    },
+    "devDependencies": {
+        "@types/node": "^22.10.0",
+        "@types/vscode": "^1.105.0",
+        "@vscode/vsce": "^3.0.0",
+        "esbuild": "^0.25.0",
+        "typescript": "^5.9.0"
+    }
 }

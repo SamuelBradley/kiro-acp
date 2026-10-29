@@ -303,7 +303,9 @@ function toolResults(messages: readonly vscode.LanguageModelChatRequestMessage[]
 
 /** The chat's enabled tools, in the shape the bridge offers them to Kiro. */
 function bridgeToolsFrom(tools: readonly vscode.LanguageModelChatTool[]): BridgeTool[] {
-	return tools.map(tool => ({
+	// Copilot's Autopilot completion tool. Kiro ends a turn by replying without a tool call, so it is not offered this
+	// one. Offered to Kiro, it kept the turn running after its result.
+	return tools.filter(tool => tool.name !== 'task_complete').map(tool => ({
 		name: tool.name,
 		description: tool.description,
 		inputSchema: tool.inputSchema ?? { type: 'object', properties: {} },

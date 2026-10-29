@@ -58,3 +58,7 @@ npm run check     # self-checks that do not need kiro-cli
 npm run smoke     # end-to-end test against your kiro-cli login, which uses a few credits
 npm run package   # build kiro-acp-<version>.vsix
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
