@@ -9,7 +9,8 @@ export interface BridgeTool {
 }
 
 export interface BridgeHost {
-	listTools(): readonly BridgeTool[];
+	/** The tools offered to the chat session `sessionKey`. */
+	listTools(sessionKey: string): readonly BridgeTool[];
 	/** Runs a tool for the chat session `sessionKey` and returns its text result. Throws on failure. */
 	callTool(sessionKey: string, name: string, input: unknown): Promise<string>;
 }
@@ -119,7 +120,7 @@ export class McpBridge {
 			case 'ping':
 				return result(id, {});
 			case 'tools/list':
-				return result(id, { tools: this.host.listTools() });
+				return result(id, { tools: this.host.listTools(sessionKey) });
 			case 'tools/call':
 				try {
 					const text = await this.host.callTool(sessionKey, message.params?.name, message.params?.arguments ?? {});

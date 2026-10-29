@@ -1,20 +1,37 @@
-import { randomUUID } from 'node:crypto';
 import * as os from 'node:os';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { AcpClient, type PermissionRequest } from './acpClient';
+import { continuationOf, digest, KiroConversation, type SavedConversation } from './conversation';
 import { McpBridge, type BridgeTool } from './mcpBridge';
 import { effortRequested, modelsFrom, toChatModelInfo, validEffort, type KiroModel } from './models';
+import { AGENT_NAME, allowOptionId, installAgentProfile, isBridgeTool, type UsageReport } from './kiroAgent';
+import { KiroTurn, type ToolResult } from './turn';
 import { transcriptOf, type TranscriptTurn } from './transcript';
 
 /** The language model vendor. Its models show in the Copilot Chat model picker. */
 const VENDOR = 'kiro';
 
-/** The cancellation token of the chat request whose Kiro session is running, keyed by that session. */
-const activeRequests = new Map<string, vscode.CancellationToken>();
+/** Global state key for the last model list Kiro reported. */
+const MODELS_KEY = 'kiro.models';
+
+/** Global state key for the chats whose Kiro sessions can be reopened. */
+const CONVERSATIONS_KEY = 'kiro.conversations';
+
+/** ponytail: a Kiro session that no chat has used for this long is closed to free memory. It reopens on the next message. */
+const IDLE_LIMIT_MS = 30 * 60_000;
+
+/** ponytail: chats kept for reopening. The oldest beyond this are forgotten, and their Kiro sessions stay on disk. */
+const MAX_CONVERSATIONS = 50;
 
 export function activate(context: vscode.ExtensionContext): void {
 	const output = vscode.window.createOutputChannel('Kiro ACP');
 	const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
+	try {
+		output.appendLine(`Installed Kiro agent profile at ${installAgentProfile(path.join(os.homedir(), '.kiro', 'agents'))}`);
+	} catch (error) {
+		output.appendLine(`Could not install the Kiro agent profile: ${describe(error)}`);
+	}
 
 	const acp = new AcpClient({
 		cwd,
@@ -22,24 +39,131 @@ export function activate(context: vscode.ExtensionContext): void {
 		onPermission: request => askPermission(request),
 	});
 
+	/** Turns still running, by conversation key. The bridge routes Kiro's tool calls to them. */
+	const turns = new Map<string, KiroTurn>();
+	/** The chats whose Kiro sessions can be continued. */
+	const conversations: KiroConversation[] = [];
+
 	const bridge = new McpBridge({
-		listTools: () => listVsCodeTools(),
-		callTool: (sessionKey, name, input) => invokeVsCodeTool(sessionKey, name, input),
+		listTools: sessionKey => turns.get(sessionKey)?.tools ?? [],
+		callTool: (sessionKey, name, input) => {
+			const turn = turns.get(sessionKey);
+			return turn ? turn.callTool(name, input) : Promise.reject(new Error('No Kiro turn is running for this tool call.'));
+		},
 	});
+
+	const usageItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
+	/**
+	 * Shows Kiro's context usage and last turn cost. VS Code gives language model providers no way to fill the
+	 * Copilot context indicator (microsoft/vscode#330783), so this is the only place the figures can go.
+	 */
+	const showUsage = (usage: UsageReport): void => {
+		const percent = usage.contextPercent === undefined ? '?' : usage.contextPercent.toFixed(1);
+		const credits = usage.credits === undefined ? 'unknown' : usage.credits.toFixed(3);
+		usageItem.text = `$(pulse) Kiro ${percent}% context`;
+		usageItem.tooltip = `Share of Kiro's context window in use. The last turn cost ${credits} credits.`;
+		usageItem.show();
+	};
 
 	let modelCache: Promise<KiroModel[]> | undefined;
 	const loadModels = (): Promise<KiroModel[]> => {
-		modelCache ??= acp.discoverConfig().then(modelsFrom).catch(error => {
+		modelCache ??= acp.discoverConfig().then(options => {
+			const models = modelsFrom(options);
+			if (models.length === 0) {
+				throw new Error('kiro-cli returned no model list.');
+			}
+			void context.globalState.update(MODELS_KEY, models);
+			return models;
+		}).catch(error => {
 			modelCache = undefined;
 			output.appendLine(`Could not read Kiro models: ${describe(error)}`);
-			return [];
+			// Keep offering the last list that worked, so the picker survives a slow or failed kiro-cli start.
+			return context.globalState.get<KiroModel[]>(MODELS_KEY) ?? [];
 		});
 		return modelCache;
 	};
 
+	const persist = (): void => {
+		const saved = conversations.flatMap(conversation => {
+			const entry = conversation.toSaved();
+			return entry ? [entry] : [];
+		});
+		void context.globalState.update(CONVERSATIONS_KEY, saved);
+	};
+
+	const newConversation = (): KiroConversation => {
+		const conversation = new KiroConversation(acp, bridge);
+		conversations.push(conversation);
+		return conversation;
+	};
+
+	/** Stops tracking a chat. Its Kiro session is closed, and it cannot be continued afterwards. */
+	const forget = (conversation: KiroConversation): void => {
+		const index = conversations.indexOf(conversation);
+		if (index >= 0) {
+			conversations.splice(index, 1);
+		}
+		void conversation.suspend();
+		persist();
+	};
+
 	/**
-	 * Answers one chat request with a Kiro model. The chat sends the whole conversation, so each
-	 * request gets its own Kiro session, closed once the answer is complete.
+	 * Closes idle Kiro sessions to free memory. They reopen when their chat continues. Chats beyond the limit
+	 * are forgotten, oldest first.
+	 */
+	const tidy = (): void => {
+		const cutoff = Date.now() - IDLE_LIMIT_MS;
+		for (const conversation of conversations) {
+			if (!conversation.busy && conversation.isOpen && conversation.lastUsed < cutoff) {
+				void conversation.suspend();
+			}
+		}
+		const idle = conversations.filter(conversation => !conversation.busy).sort((a, b) => a.lastUsed - b.lastUsed);
+		for (const conversation of idle.slice(0, Math.max(0, conversations.length - MAX_CONVERSATIONS))) {
+			forget(conversation);
+		}
+	};
+
+	// Chats from earlier VS Code sessions. Their Kiro sessions reopen when a chat continues.
+	for (const saved of context.globalState.get<SavedConversation[]>(CONVERSATIONS_KEY, [])) {
+		conversations.push(new KiroConversation(acp, bridge, saved));
+	}
+
+	/**
+	 * Relays a turn's events into the chat until the turn ends or asks for a tool to run. When a tool is
+	 * requested, the response ends. VS Code runs the tool with its own context and then calls this
+	 * provider again with the result, which resumes the same turn.
+	 */
+	const drive = async (
+		turn: KiroTurn,
+		progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+		token: vscode.CancellationToken,
+	): Promise<void> => {
+		const cancellation = token.onCancellationRequested(() => turn.cancel());
+		try {
+			for (;;) {
+				const event = await turn.next();
+				if (event.kind === 'text') {
+					progress.report(new vscode.LanguageModelTextPart(event.text));
+				} else if (event.kind === 'tool') {
+					progress.report(new vscode.LanguageModelToolCallPart(event.callId, event.name, (event.input ?? {}) as object));
+					return;
+				} else if (event.kind === 'done') {
+					output.appendLine(`Turn finished: ${event.stopReason}`);
+					return;
+				} else {
+					throw event.error;
+				}
+			}
+		} finally {
+			cancellation.dispose();
+		}
+	};
+
+	/**
+	 * Answers a chat request with a Kiro model. A request that carries results for tool calls continues the
+	 * turn that asked for them. A request that adds one message to a chat the extension knows continues that
+	 * chat's Kiro session. Any other request starts a new chat.
 	 */
 	const answer = async (
 		model: vscode.LanguageModelChatInformation,
@@ -48,52 +172,74 @@ export function activate(context: vscode.ExtensionContext): void {
 		progress: vscode.Progress<vscode.LanguageModelResponsePart>,
 		token: vscode.CancellationToken,
 	): Promise<void> => {
-		const known = (await loadModels()).find(entry => entry.id === model.id);
-		const effort = validEffort(known, effortRequested(options));
-		const turns: TranscriptTurn[] = messages.map(message => ({
-			role: message.role === vscode.LanguageModelChatMessageRole.Assistant ? 'assistant' : 'user',
-			text: message.content.map(part => part instanceof vscode.LanguageModelTextPart ? part.value : '').join(''),
-		}));
-
-		const key = `chat:${randomUUID()}`;
-		await bridge.start();
-		const { sessionId } = await acp.newSession(bridge.urlFor(key));
-		const abort = new AbortController();
-		const subscription = token.onCancellationRequested(() => abort.abort());
-		activeRequests.set(key, token);
-		try {
-			await acp.setOption(sessionId, 'model', model.id);
-			if (effort) {
-				await acp.setOption(sessionId, 'effortLevel', effort);
-			}
-			const stop = await acp.prompt(sessionId, transcriptOf(turns), update => report(update, progress), abort.signal);
-			output.appendLine(`Turn finished: ${stop} (${model.id}${effort ? `, effort ${effort}` : ''})`);
-		} finally {
-			activeRequests.delete(key);
-			bridge.release(key);
-			subscription.dispose();
-			await acp.closeSession(sessionId).catch(() => undefined);
+		const results = toolResults(messages);
+		const continued = [...turns.values()].find(turn => results.some(result => turn.owns(result.callId)));
+		if (continued) {
+			continued.resolveTools(results);
+			await drive(continued, progress, token);
+			return;
 		}
+
+		tidy();
+		const known = (await loadModels()).find(entry => entry.id === model.id);
+		const texts = userTexts(messages);
+		const digests = texts.map(digest);
+		const earlier = continuationOf(conversations, digests);
+		const conversation = earlier ?? newConversation();
+		output.appendLine(earlier ? `Continuing chat ${conversation.key}.` : `Starting chat ${conversation.key}.`);
+		conversation.userMessages = digests;
+		conversation.busy = true;
+		conversation.lastUsed = Date.now();
+		const transcript = transcriptOf(transcriptFrom(messages));
+
+		const turn = new KiroTurn(conversation, acp, bridge, {
+			onUsage: showUsage,
+			log: line => output.appendLine(line),
+			onFinish: finished => {
+				turns.delete(finished.conversation.key);
+				finished.conversation.busy = false;
+				finished.conversation.lastUsed = Date.now();
+				if (finished.failed) {
+					forget(finished.conversation);
+				} else {
+					persist();
+				}
+			},
+		});
+		turns.set(conversation.key, turn);
+		turn.start({
+			agent: AGENT_NAME,
+			model: model.id,
+			effort: validEffort(known, effortRequested(options)),
+			// A session that is reopened already holds the earlier messages, so only the newest one is sent.
+			prompt: earlier ? texts[texts.length - 1] : transcript,
+			transcript,
+			tools: bridgeToolsFrom(options.tools ?? []),
+		});
+		await drive(turn, progress, token);
 	};
 
 	context.subscriptions.push(
 		output,
+		usageItem,
 		{ dispose: () => bridge.dispose() },
 		{ dispose: () => acp.dispose() },
+		{ dispose: () => turns.forEach(turn => turn.cancel()) },
 		vscode.lm.registerLanguageModelChatProvider(VENDOR, {
-			provideLanguageModelChatInformation: async () => (await loadModels()).map(
-				model => toChatModelInfo(model) as unknown as vscode.LanguageModelChatInformation,
-			),
+			provideLanguageModelChatInformation: async () => {
+				const models = await loadModels();
+				output.appendLine(`Offering ${models.length} Kiro models.`);
+				return models.map(model => toChatModelInfo(model) as unknown as vscode.LanguageModelChatInformation);
+			},
 			provideLanguageModelChatResponse: (model, messages, options, progress, token) => answer(model, messages, options, progress, token),
 			provideTokenCount: async (_model, text) => {
-				const value = typeof text === 'string'
-					? text
-					: text.content.map(part => part instanceof vscode.LanguageModelTextPart ? part.value : '').join('');
+				const value = typeof text === 'string' ? text : textOf(text.content);
 				return Math.ceil(value.length / 4);
 			},
 		}),
 	);
 
+	void loadModels();
 	output.appendLine(`Kiro ACP ready. Sessions run in ${cwd}`);
 }
 
@@ -103,6 +249,10 @@ function describe(error: unknown): string {
 
 /** Shows Kiro's permission options as a quick pick. Dismissing the pick declines the request. */
 async function askPermission(request: PermissionRequest): Promise<string | undefined> {
+	if (isBridgeTool(request.toolCall?.title)) {
+		// The tool runs through VS Code's own confirmations, so this extra prompt is skipped.
+		return allowOptionId(request.options);
+	}
 	const picked = await vscode.window.showQuickPick(
 		request.options.map(option => ({ label: option.name, optionId: option.optionId })),
 		{ title: `Kiro wants to run: ${request.toolCall?.title ?? 'a tool'}`, ignoreFocusOut: true },
@@ -110,28 +260,52 @@ async function askPermission(request: PermissionRequest): Promise<string | undef
 	return picked?.optionId;
 }
 
-/** Streams Kiro's answer text into the chat. Tool activity is not shown, as the language model API has no slot for it. */
-function report(update: any, progress: vscode.Progress<vscode.LanguageModelResponsePart>): void {
-	if (update?.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text') {
-		progress.report(new vscode.LanguageModelTextPart(update.content.text));
-	}
+/** The text of a list of message parts. Other parts contribute nothing. */
+function textOf(parts: readonly unknown[]): string {
+	return parts.map(part => part instanceof vscode.LanguageModelTextPart ? part.value : '').join('');
 }
 
-function listVsCodeTools(): BridgeTool[] {
-	// ponytail: every registered VS Code tool is offered to Kiro. Filter by the chat's enabled tools if the list gets too long for the model.
-	return vscode.lm.tools.map(tool => ({
+/** The text of each user message that has any, in order. Tool results carry no text here and are skipped. */
+function userTexts(messages: readonly vscode.LanguageModelChatRequestMessage[]): string[] {
+	return messages
+		.filter(message => message.role === vscode.LanguageModelChatMessageRole.User)
+		.map(message => textOf(message.content))
+		.filter(text => text.trim().length > 0);
+}
+
+/** Turns VS Code's message parts into plain text for a new Kiro session. Tool calls and results stay visible as text. */
+function transcriptFrom(messages: readonly vscode.LanguageModelChatRequestMessage[]): TranscriptTurn[] {
+	return messages.map(message => ({
+		role: message.role === vscode.LanguageModelChatMessageRole.Assistant ? 'assistant' : 'user',
+		text: message.content.map(describePart).filter(text => text.length > 0).join('\n'),
+	}));
+}
+
+function describePart(part: unknown): string {
+	if (part instanceof vscode.LanguageModelTextPart) {
+		return part.value;
+	}
+	if (part instanceof vscode.LanguageModelToolCallPart) {
+		return `(called the ${part.name} tool with ${JSON.stringify(part.input)})`;
+	}
+	if (part instanceof vscode.LanguageModelToolResultPart) {
+		return `(tool result: ${textOf(part.content)})`;
+	}
+	return '';
+}
+
+/** The tool results VS Code sends back for the calls this provider made. */
+function toolResults(messages: readonly vscode.LanguageModelChatRequestMessage[]): ToolResult[] {
+	return messages.flatMap(message => message.content.flatMap(part => part instanceof vscode.LanguageModelToolResultPart
+		? [{ callId: part.callId, text: textOf(part.content), isError: false }]
+		: []));
+}
+
+/** The chat's enabled tools, in the shape the bridge offers them to Kiro. */
+function bridgeToolsFrom(tools: readonly vscode.LanguageModelChatTool[]): BridgeTool[] {
+	return tools.map(tool => ({
 		name: tool.name,
 		description: tool.description,
 		inputSchema: tool.inputSchema ?? { type: 'object', properties: {} },
 	}));
-}
-
-async function invokeVsCodeTool(sessionKey: string, name: string, input: unknown): Promise<string> {
-	const token = activeRequests.get(sessionKey);
-	if (!token) {
-		throw new Error('No chat request is active for this tool call.');
-	}
-	// ponytail: the language model API does not pass a chat invocation token, so tools that need one may refuse to run.
-	const result = await vscode.lm.invokeTool(name, { input: input as object, toolInvocationToken: undefined }, token);
-	return result.content.flatMap(part => part instanceof vscode.LanguageModelTextPart ? [part.value] : []).join('\n');
 }

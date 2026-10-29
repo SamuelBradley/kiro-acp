@@ -3,6 +3,11 @@ import { splitLines } from '../src/framing';
 import { McpBridge } from '../src/mcpBridge';
 import { effortRequested, modelsFrom, toChatModelInfo, validEffort } from '../src/models';
 import { transcriptOf } from '../src/transcript';
+import { continuationOf, digest, normalize } from '../src/conversation';
+import { AGENT_NAME, allowOptionId, installAgentProfile, isBridgeTool, usageFrom } from '../src/kiroAgent';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 // Framing: a line split across two chunks is joined, and blank lines are dropped.
 const first = splitLines('{"a":1}\n{"b":');
@@ -52,6 +57,34 @@ assert.equal(transcriptOf([{ role: 'user', text: 'hi' }]), 'hi');
 const transcript = transcriptOf([{ role: 'user', text: 'hi' }, { role: 'assistant', text: 'hello' }, { role: 'user', text: 'name?' }]);
 assert.ok(transcript.includes('[assistant] hello'));
 assert.ok(transcript.endsWith('<latest_user_message>\nname?\n</latest_user_message>'));
+
+// Kiro agent: the profile offers only the VS Code bridge tools, bridge permissions are recognised, and usage is read from Kiro's metadata.
+const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kiro-agent-'));
+const profilePath = installAgentProfile(profileDir);
+const profile = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+assert.equal(profile.name, AGENT_NAME);
+assert.deepEqual(profile.tools, ['@vscode']);
+assert.equal(installAgentProfile(profileDir), profilePath);
+fs.rmSync(profileDir, { recursive: true });
+assert.ok(isBridgeTool('@vscode/marker_lookup'));
+assert.ok(!isBridgeTool('fs_write'));
+assert.equal(allowOptionId([{ optionId: 'reject', kind: 'reject_once' }, { optionId: 'accept', kind: 'allow_once' }]), 'accept');
+assert.equal(allowOptionId([{ optionId: 'reject', kind: 'reject_once' }]), undefined);
+assert.deepEqual(usageFrom({ _meta: { kiro: { contextUsage: { usagePercentage: 2.5 } } } }), { contextPercent: 2.5, credits: undefined });
+assert.deepEqual(usageFrom({ _meta: { kiro: { promptTurnSummaries: [{ unit: 'credit', usage: 0.035 }] } } }), { contextPercent: undefined, credits: 0.035 });
+assert.equal(usageFrom({ sessionUpdate: 'agent_message_chunk' }), undefined);
+
+// Conversations: a follow-up continues the one conversation that its earlier messages match exactly.
+assert.equal(normalize('  hello \n  there '), 'hello there');
+assert.equal(digest('  hello \n  there '), digest('hello there'));
+assert.notEqual(digest('hello'), digest('goodbye'));
+const chatA = { id: 'a', userMessages: ['hi'], busy: false };
+const chatB = { id: 'b', userMessages: ['hi', 'how are you'], busy: false };
+assert.equal(continuationOf([chatA, chatB], ['hi', 'tell me more'])?.id, 'a');
+assert.equal(continuationOf([chatA, { ...chatA, id: 'c' }], ['hi', 'tell me more']), undefined, 'two matching chats cannot be told apart');
+assert.equal(continuationOf([{ ...chatA, busy: true }], ['hi', 'tell me more']), undefined, 'a busy session takes no new message');
+assert.equal(continuationOf([chatB], ['hi', 'changed', 'tell me more']), undefined, 'an edited earlier message starts a new session');
+assert.equal(continuationOf([chatA], ['hi']), undefined, 'a request that adds no message is not a follow-up');
 
 // MCP bridge: tools/list and tools/call work over HTTP, an unknown path is refused, and a released session stops answering.
 const bridge = new McpBridge({

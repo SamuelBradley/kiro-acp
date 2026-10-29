@@ -49,6 +49,7 @@ interface Waiter {
  */
 export class AcpClient {
 	private child?: ChildProcessWithoutNullStreams;
+	private launches = 0;
 	private ready?: Promise<void>;
 	private nextId = 1;
 	private buffer = '';
@@ -57,6 +58,11 @@ export class AcpClient {
 	private readonly configBySession = new Map<string, readonly ConfigOption[]>();
 
 	constructor(private readonly options: AcpClientOptions) { }
+
+	/** Changes each time kiro-cli starts. A session is open only in the process it was opened in. */
+	get processId(): number {
+		return this.launches;
+	}
 
 	/** Starts the process and completes the ACP `initialize` handshake. */
 	start(): Promise<void> {
@@ -80,6 +86,43 @@ export class AcpClient {
 		return { sessionId: response.sessionId, configOptions };
 	}
 
+	/**
+	 * Opens a session that Kiro saved, with the MCP endpoint to use from now on. Kiro replays the saved
+	 * history as session updates while it loads. Those reach no handler, because no prompt is running.
+	 */
+	async loadSession(sessionId: string, mcpUrl: string): Promise<void> {
+		await this.start();
+		await this.request('session/load', {
+			sessionId,
+			cwd: this.options.cwd,
+			mcpServers: [{ type: 'http', name: 'vscode', url: mcpUrl, headers: [] }],
+		});
+	}
+
+	/**
+	 * True when Kiro still lists the session for this folder. Kiro answers a load for an unknown session id
+	 * without an error, so a load alone cannot tell a missing session from a saved one.
+	 */
+	async hasSession(sessionId: string): Promise<boolean> {
+		await this.start();
+		let cursor: string | undefined;
+		// ponytail: at most 20 pages of listed sessions are read. A folder with more than that is treated as missing.
+		for (let page = 0; page < 20; page++) {
+			const response = await this.request<{ sessions?: readonly { readonly sessionId: string }[]; nextCursor?: string | null }>('session/list', {
+				cwd: this.options.cwd,
+				...(cursor ? { cursor } : {}),
+			});
+			if ((response.sessions ?? []).some(session => session.sessionId === sessionId)) {
+				return true;
+			}
+			cursor = response.nextCursor ?? undefined;
+			if (!cursor) {
+				return false;
+			}
+		}
+		return false;
+	}
+
 	async closeSession(sessionId: string): Promise<void> {
 		await this.request('session/close', { sessionId });
 	}
@@ -98,6 +141,9 @@ export class AcpClient {
 	 * Aborting the signal sends `session/cancel`; the returned promise then resolves with the stop reason.
 	 */
 	async prompt(sessionId: string, text: string, onUpdate: (update: any) => void, signal: AbortSignal): Promise<string> {
+		if (signal.aborted) {
+			return 'cancelled';
+		}
 		this.updateHandlers.set(sessionId, onUpdate);
 		const cancel = () => this.notify('session/cancel', { sessionId });
 		signal.addEventListener('abort', cancel, { once: true });
@@ -127,6 +173,7 @@ export class AcpClient {
 	private async launch(): Promise<void> {
 		const child = spawn('kiro-cli', KIRO_ARGS, { cwd: this.options.cwd, windowsHide: true });
 		this.child = child;
+		this.launches++;
 		this.buffer = '';
 		child.stdout.setEncoding('utf8');
 		child.stdout.on('data', (chunk: string) => this.onStdout(chunk));
