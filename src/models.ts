@@ -76,7 +76,7 @@ export function toChatModelInfo(model: KiroModel) {
 		tooltip: model.description,
 		maxInputTokens: model.contextWindow - MAX_OUTPUT_TOKENS,
 		maxOutputTokens: MAX_OUTPUT_TOKENS,
-		capabilities: { toolCalling: true, imageInput: false },
+		capabilities: { toolCalling: true, imageInput: true },
 	};
 	if (model.effortLevels.length === 0) {
 		return info;

@@ -31,6 +31,16 @@ export interface PermissionRequest {
 	readonly options: readonly { readonly optionId: string; readonly name: string; readonly kind?: string }[];
 }
 
+/** An image in a prompt. `data` is the base64 encoding of the image bytes. */
+export interface ImageBlock {
+	readonly type: 'image';
+	readonly mimeType: string;
+	readonly data: string;
+}
+
+/** One part of a prompt: text, or an image. */
+export type PromptBlock = { readonly type: 'text'; readonly text: string } | ImageBlock;
+
 export interface AcpClientOptions {
 	readonly cwd: string;
 	readonly log: (line: string) => void;
@@ -140,7 +150,7 @@ export class AcpClient {
 	 * Sends one user turn and streams the session's updates to `onUpdate`.
 	 * Aborting the signal sends `session/cancel`; the returned promise then resolves with the stop reason.
 	 */
-	async prompt(sessionId: string, text: string, onUpdate: (update: any) => void, signal: AbortSignal): Promise<string> {
+	async prompt(sessionId: string, blocks: readonly PromptBlock[], onUpdate: (update: any) => void, signal: AbortSignal): Promise<string> {
 		if (signal.aborted) {
 			return 'cancelled';
 		}
@@ -150,7 +160,7 @@ export class AcpClient {
 		try {
 			const response = await this.request<{ stopReason: string }>('session/prompt', {
 				sessionId,
-				prompt: [{ type: 'text', text }],
+				prompt: blocks,
 			});
 			return response.stopReason;
 		} finally {

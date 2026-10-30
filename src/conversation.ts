@@ -8,11 +8,11 @@ export function normalize(text: string): string {
 }
 
 /**
- * A fingerprint of a user message. Conversations keep these instead of the text, so chat content is not
- * stored between VS Code sessions.
+ * A fingerprint of a user message: its text and the base64 data of its images. Conversations keep these instead
+ * of the text, so chat content is not stored between VS Code sessions.
  */
-export function digest(text: string): string {
-	return createHash('sha256').update(normalize(text)).digest('hex');
+export function digest(text: string, images: readonly string[] = []): string {
+	return createHash('sha256').update([normalize(text), ...images].join('\0')).digest('hex');
 }
 
 /**

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { AcpClient } from '../src/acpClient';
+import * as zlib from 'node:zlib';
+import { AcpClient, type PromptBlock } from '../src/acpClient';
 import { KiroConversation } from '../src/conversation';
 import { AGENT_NAME, installAgentProfile } from '../src/kiroAgent';
 import { McpBridge, type BridgeTool } from '../src/mcpBridge';
@@ -14,6 +15,7 @@ import { KiroTurn } from '../src/turn';
 // 3. a follow-up in a new kiro-cli process, as after a VS Code restart;
 // 4. a follow-up whose saved session Kiro no longer has, which starts again from the transcript.
 // Steps 2 and 3 can only be answered from Kiro's saved history, because the follow-up text does not contain it.
+// A fifth step sends an image in a chat of its own, and checks that the model read it.
 // Uses your kiro-cli login and a small amount of credits.
 
 const verbose = process.env.KIRO_SMOKE_VERBOSE === '1';
@@ -42,13 +44,18 @@ function startClient(): AcpClient {
 	return client;
 }
 
+/** A prompt given as text, or as content blocks. */
+function blocksOf(value: string | readonly PromptBlock[]): PromptBlock[] {
+	return typeof value === 'string' ? [{ type: 'text', text: value }] : [...value];
+}
+
 /** Runs one turn to its end, playing VS Code's part for any tool call. */
 async function runTurn(
 	client: AcpClient,
 	conversation: KiroConversation,
-	prompt: string,
+	prompt: string | readonly PromptBlock[],
 	model: string,
-	transcript = prompt,
+	transcript: string | readonly PromptBlock[] = prompt,
 ): Promise<{ answer: string; stop: string; handedOff: string[] }> {
 	conversation.busy = true;
 	const turn = new KiroTurn(conversation, client, bridge, {
@@ -60,7 +67,7 @@ async function runTurn(
 		},
 	});
 	turns.set(conversation.key, turn);
-	turn.start({ agent: AGENT_NAME, model, effort: 'low', prompt, transcript, tools });
+	turn.start({ agent: AGENT_NAME, model, effort: 'low', prompt: blocksOf(prompt), transcript: blocksOf(transcript), tools });
 
 	let answer = '';
 	const handedOff: string[] = [];
@@ -77,6 +84,27 @@ async function runTurn(
 			throw event.error;
 		}
 	}
+}
+
+/** A 16x16 solid red PNG, built here so the check needs no image file. */
+function redPng(): Buffer {
+	const chunk = (type: string, data: Buffer): Buffer => {
+		const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+		const length = Buffer.alloc(4);
+		length.writeUInt32BE(data.length);
+		const crc = Buffer.alloc(4);
+		crc.writeUInt32BE(zlib.crc32(body) >>> 0);
+		return Buffer.concat([length, body, crc]);
+	};
+	const size = 16;
+	const header = Buffer.from([0, 0, 0, size, 0, 0, 0, size, 8, 2, 0, 0, 0]);
+	const row = Buffer.from([0, ...Array(size).fill([255, 0, 0]).flat()]);
+	return Buffer.concat([
+		Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+		chunk('IHDR', header),
+		chunk('IDAT', zlib.deflateSync(Buffer.concat(Array(size).fill(row)))),
+		chunk('IEND', Buffer.alloc(0)),
+	]);
 }
 
 async function main(): Promise<void> {
@@ -140,6 +168,17 @@ async function main(): Promise<void> {
 		assert.ok(fourth.answer.includes('ZEBRA-9'), 'expected the fallback to answer from the transcript');
 		assert.notEqual(gone.acpSessionId, savedMissing, 'expected a new Kiro session to replace the missing one');
 		await gone.suspend();
+
+		// 5. An image sent as an image block in a new chat. Only a model that reads images can name its color.
+		const picture = new KiroConversation(client, bridge);
+		const seen = await runTurn(client, picture, [
+			{ type: 'text', text: 'What color is this image? Reply with one word only.' },
+			{ type: 'image', mimeType: 'image/png', data: redPng().toString('base64') },
+		], haiku.id);
+		await picture.suspend();
+		console.log(`image answer: ${seen.answer.trim()}`);
+		assert.equal(seen.stop, 'end_turn');
+		assert.match(seen.answer, /red/i, 'expected the model to read the image');
 	} finally {
 		await conversation.suspend();
 	}

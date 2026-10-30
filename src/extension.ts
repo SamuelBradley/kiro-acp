@@ -1,7 +1,7 @@
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { AcpClient, type PermissionRequest } from './acpClient';
+import { AcpClient, type ImageBlock, type PermissionRequest, type PromptBlock } from './acpClient';
 import { continuationOf, digest, KiroConversation, type SavedConversation } from './conversation';
 import { McpBridge, type BridgeTool } from './mcpBridge';
 import { effortRequested, modelsFrom, toChatModelInfo, validEffort, type KiroModel } from './models';
@@ -27,8 +27,9 @@ const MAX_CONVERSATIONS = 50;
 export function activate(context: vscode.ExtensionContext): void {
 	const output = vscode.window.createOutputChannel('Kiro ACP');
 	const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
+	const agentDir = path.join(os.homedir(), '.kiro', 'agents');
 	try {
-		output.appendLine(`Installed Kiro agent profile at ${installAgentProfile(path.join(os.homedir(), '.kiro', 'agents'))}`);
+		output.appendLine(`Installed Kiro agent profile at ${installAgentProfile(agentDir)}`);
 	} catch (error) {
 		output.appendLine(`Could not install the Kiro agent profile: ${describe(error)}`);
 	}
@@ -66,7 +67,11 @@ export function activate(context: vscode.ExtensionContext): void {
 	};
 
 	let modelCache: Promise<KiroModel[]> | undefined;
-	const loadModels = (): Promise<KiroModel[]> => {
+	const modelsChanged = new vscode.EventEmitter<void>();
+	const loadModels = (refresh = false): Promise<KiroModel[]> => {
+		if (refresh) {
+			modelCache = undefined;
+		}
 		modelCache ??= acp.discoverConfig().then(options => {
 			const models = modelsFrom(options);
 			if (models.length === 0) {
@@ -77,6 +82,9 @@ export function activate(context: vscode.ExtensionContext): void {
 		}).catch(error => {
 			modelCache = undefined;
 			output.appendLine(`Could not read Kiro models: ${describe(error)}`);
+			if (refresh) {
+				throw error;
+			}
 			// Keep offering the last list that worked, so the picker survives a slow or failed kiro-cli start.
 			return context.globalState.get<KiroModel[]>(MODELS_KEY) ?? [];
 		});
@@ -182,15 +190,18 @@ export function activate(context: vscode.ExtensionContext): void {
 
 		tidy();
 		const known = (await loadModels()).find(entry => entry.id === model.id);
-		const texts = userTexts(messages);
-		const digests = texts.map(digest);
+		const users = userMessagesFrom(messages);
+		const digests = users.map(user => digest(user.text, user.images.map(image => image.data)));
 		const earlier = continuationOf(conversations, digests);
 		const conversation = earlier ?? newConversation();
 		output.appendLine(earlier ? `Continuing chat ${conversation.key}.` : `Starting chat ${conversation.key}.`);
 		conversation.userMessages = digests;
 		conversation.busy = true;
 		conversation.lastUsed = Date.now();
-		const transcript = transcriptOf(transcriptFrom(messages));
+		const transcript: PromptBlock[] = [
+			{ type: 'text', text: transcriptOf(transcriptFrom(messages)) },
+			...messages.flatMap(message => imagesOf(message.content)),
+		];
 
 		const turn = new KiroTurn(conversation, acp, bridge, {
 			onUsage: showUsage,
@@ -212,7 +223,7 @@ export function activate(context: vscode.ExtensionContext): void {
 			model: model.id,
 			effort: validEffort(known, effortRequested(options)),
 			// A session that is reopened already holds the earlier messages, so only the newest one is sent.
-			prompt: earlier ? texts[texts.length - 1] : transcript,
+			prompt: earlier ? promptOf(users[users.length - 1]) : transcript,
 			transcript,
 			tools: bridgeToolsFrom(options.tools ?? []),
 		});
@@ -222,13 +233,33 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(
 		output,
 		usageItem,
+		modelsChanged,
 		{ dispose: () => bridge.dispose() },
 		{ dispose: () => acp.dispose() },
 		{ dispose: () => turns.forEach(turn => turn.cancel()) },
+		vscode.commands.registerCommand('kiro-acp.refreshModels', async () => {
+			try {
+				const models = await loadModels(true);
+				modelsChanged.fire();
+				void vscode.window.showInformationMessage(`Detected ${models.length} Kiro models.`);
+			} catch (error) {
+				void vscode.window.showErrorMessage(`Could not detect Kiro models: ${describe(error)}`);
+			}
+		}),
+		vscode.commands.registerCommand('kiro-acp.regenerateAgent', () => {
+			try {
+				const profilePath = installAgentProfile(agentDir);
+				output.appendLine(`Regenerated Kiro agent profile at ${profilePath}`);
+				void vscode.window.showInformationMessage('Kiro agent profile regenerated with Copilot tools.');
+			} catch (error) {
+				output.appendLine(`Could not regenerate the Kiro agent profile: ${describe(error)}`);
+				void vscode.window.showErrorMessage(`Could not regenerate the Kiro agent profile: ${describe(error)}`);
+			}
+		}),
 		vscode.lm.registerLanguageModelChatProvider(VENDOR, {
+			onDidChangeLanguageModelChatInformation: modelsChanged.event,
 			provideLanguageModelChatInformation: async () => {
 				const models = await loadModels();
-				output.appendLine(`Offering ${models.length} Kiro models.`);
 				return models.map(model => toChatModelInfo(model) as unknown as vscode.LanguageModelChatInformation);
 			},
 			provideLanguageModelChatResponse: (model, messages, options, progress, token) => answer(model, messages, options, progress, token),
@@ -265,19 +296,54 @@ function textOf(parts: readonly unknown[]): string {
 	return parts.map(part => part instanceof vscode.LanguageModelTextPart ? part.value : '').join('');
 }
 
-/** The text of each user message that has any, in order. Tool results carry no text here and are skipped. */
-function userTexts(messages: readonly vscode.LanguageModelChatRequestMessage[]): string[] {
-	return messages
-		.filter(message => message.role === vscode.LanguageModelChatMessageRole.User)
-		.map(message => textOf(message.content))
-		.filter(text => text.trim().length > 0);
+/** A user message's text, and its images as base64 image blocks for Kiro. */
+interface UserMessage {
+	readonly text: string;
+	readonly images: readonly ImageBlock[];
 }
 
-/** Turns VS Code's message parts into plain text for a new Kiro session. Tool calls and results stay visible as text. */
+/** The user messages that have text or images, in order. Tool results carry neither here, so they are skipped. */
+function userMessagesFrom(messages: readonly vscode.LanguageModelChatRequestMessage[]): UserMessage[] {
+	return messages
+		.filter(message => message.role === vscode.LanguageModelChatMessageRole.User)
+		.map(message => ({ text: textOf(message.content), images: imagesOf(message.content) }))
+		.filter(message => message.text.trim().length > 0 || message.images.length > 0);
+}
+
+/** The prompt for one user message: its text, then its images. */
+function promptOf(message: UserMessage): PromptBlock[] {
+	return [...(message.text ? [{ type: 'text' as const, text: message.text }] : []), ...message.images];
+}
+
+/** True for an image part. Only images are sent to Kiro. */
+function isImage(part: unknown): part is vscode.LanguageModelDataPart {
+	return part instanceof vscode.LanguageModelDataPart && part.mimeType.startsWith('image/');
+}
+
+/** The images in a list of message parts, base64 encoded for Kiro. */
+function imagesOf(parts: readonly unknown[]): ImageBlock[] {
+	return parts.filter(isImage).map((part): ImageBlock => ({
+		type: 'image',
+		mimeType: part.mimeType,
+		data: Buffer.from(part.data).toString('base64'),
+	}));
+}
+
+/**
+ * Turns VS Code's message parts into plain text for a new Kiro session. Tool calls and results stay visible as text.
+ * Each image is marked with its number. The image data is sent after the text, in the same order.
+ */
 function transcriptFrom(messages: readonly vscode.LanguageModelChatRequestMessage[]): TranscriptTurn[] {
+	let images = 0;
 	return messages.map(message => ({
 		role: message.role === vscode.LanguageModelChatMessageRole.Assistant ? 'assistant' : 'user',
-		text: message.content.map(describePart).filter(text => text.length > 0).join('\n'),
+		text: message.content.map(part => {
+			if (!isImage(part)) {
+				return describePart(part);
+			}
+			images++;
+			return `[image ${images}]`;
+		}).filter(text => text.length > 0).join('\n'),
 	}));
 }
 

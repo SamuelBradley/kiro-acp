@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { AcpClient, ConfigOption } from './acpClient';
+import type { AcpClient, ConfigOption, PromptBlock } from './acpClient';
 import type { KiroConversation } from './conversation';
 import { usageFrom, type UsageReport } from './kiroAgent';
 import type { BridgeTool, McpBridge } from './mcpBridge';
@@ -12,8 +12,8 @@ export interface TurnSetup {
 	readonly agent: string;
 	readonly model: string;
 	readonly effort?: string;
-	readonly prompt: string;
-	readonly transcript: string;
+	readonly prompt: readonly PromptBlock[];
+	readonly transcript: readonly PromptBlock[];
 	readonly tools: readonly BridgeTool[];
 }
 
@@ -68,6 +68,7 @@ export class KiroTurn {
 	private readonly calls = new Map<string, PendingCall>();
 	private readonly controller = new AbortController();
 	private waitTimer?: ReturnType<typeof setTimeout>;
+	private finished = false;
 
 	constructor(
 		readonly conversation: KiroConversation,
@@ -135,8 +136,13 @@ export class KiroTurn {
 
 	/** Stops the turn. Tool calls that are still waiting get an error result. */
 	cancel(): void {
+		if (this.finished) {
+			return;
+		}
 		this.controller.abort();
 		this.settleAll('The chat request was cancelled.');
+		this.push({ kind: 'done', stopReason: 'cancelled' });
+		this.finish();
 	}
 
 	private async run(setup: TurnSetup): Promise<void> {
@@ -146,17 +152,31 @@ export class KiroTurn {
 				return;
 			}
 			await this.bridge.start();
+			if (this.controller.signal.aborted) {
+				return;
+			}
 			const { sessionId, restored } = await this.attach(setup.agent);
+			if (this.controller.signal.aborted) {
+				return;
+			}
 			await this.acp.setOption(sessionId, 'model', setup.model);
+			if (this.controller.signal.aborted) {
+				return;
+			}
 			if (setup.effort) {
 				await this.acp.setOption(sessionId, 'effortLevel', setup.effort);
+				if (this.controller.signal.aborted) {
+					return;
+				}
 			}
-			const text = restored ? setup.prompt : setup.transcript;
-			const stopReason = await this.acp.prompt(sessionId, text, update => this.onUpdate(update), this.controller.signal);
+			const blocks = restored ? setup.prompt : setup.transcript;
+			const stopReason = await this.acp.prompt(sessionId, blocks, update => this.onUpdate(update), this.controller.signal);
 			this.push({ kind: 'done', stopReason });
 		} catch (error) {
-			this.failed = true;
-			this.push({ kind: 'error', error: error instanceof Error ? error : new Error(String(error)) });
+			if (!this.controller.signal.aborted) {
+				this.failed = true;
+				this.push({ kind: 'error', error: error instanceof Error ? error : new Error(String(error)) });
+			}
 		} finally {
 			this.finish();
 		}
@@ -210,6 +230,10 @@ export class KiroTurn {
 	}
 
 	private finish(): void {
+		if (this.finished) {
+			return;
+		}
+		this.finished = true;
 		clearTimeout(this.waitTimer);
 		this.settleAll('The Kiro turn ended before the tool call finished.');
 		this.hooks.onFinish(this);
@@ -227,6 +251,9 @@ export class KiroTurn {
 	}
 
 	private push(event: TurnEvent): void {
+		if (this.finished) {
+			return;
+		}
 		this.events.push(event);
 		this.wake?.();
 	}

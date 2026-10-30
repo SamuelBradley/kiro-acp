@@ -1,9 +1,9 @@
 {
     "name": "kiro-acp",
-    "displayName": "Kiro CLI Models for Copilot Chat",
+    "displayName": "Kiro ACP - Copilot Chat",
     "description": "Use Kiro CLI's models in GitHub Copilot Chat through the Agent Client Protocol.",
     "icon": "assets/icon.png",
-    "version": "0.6.1",
+    "version": "0.7.0",
     "publisher": "ExplorationToolkit",
     "private": true,
     "license": "MIT",
@@ -24,10 +24,20 @@
         "onLanguageModelChatProvider:kiro"
     ],
     "contributes": {
+        "commands": [
+            {
+                "command": "kiro-acp.refreshModels",
+                "title": "Kiro ACP: Refresh Kiro Models"
+            },
+            {
+                "command": "kiro-acp.regenerateAgent",
+                "title": "Kiro ACP: Regenerate Kiro Agent Profile"
+            }
+        ],
         "languageModelChatProviders": [
             {
                 "vendor": "kiro",
-                "displayName": "Kiro CLI"
+                "displayName": "Kiro ACP"
             }
         ]
     },
